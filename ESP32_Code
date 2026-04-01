@@ -1,1 +1,377 @@
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
 
+// =====================================================
+// ZAKLADNI NASTAVENI
+// =====================================================
+
+// I2C piny na ESP32
+static const int SDA_PIN = 21;
+static const int SCL_PIN = 22;
+
+// Datovy pin LED pasku
+static const int LED_PIN = 5;
+
+// Hall senzory jsou aktivni v log. 0
+static const bool ACTIVE_LOW = true;
+
+// =====================================================
+// GEOMETRIE DESKY
+// =====================================================
+
+#define COLS 6
+#define ROWS 6
+
+// Mezi hernimi LED jsou 3 neherni LED
+#define STEP 4
+
+// V jednom sloupci je 21 fyzickych LED
+#define LEDS_PER_COL ((ROWS - 1) * STEP + 1)   // 21
+
+// Celkem LED na desce
+#define TOTAL_LEDS (COLS * LEDS_PER_COL)       // 126
+
+// =====================================================
+// MCP23017
+// =====================================================
+
+// Aktualni adresy expanderu
+static const uint8_t EXP_ADDRS[3] = { 0x20, 0x25, 0x24 };
+static const int EXP_COUNT = 3;
+
+// Registry MCP23017
+static const uint8_t IODIRA = 0x00;
+static const uint8_t IODIRB = 0x01;
+static const uint8_t GPPUA  = 0x0C;
+static const uint8_t GPPUB  = 0x0D;
+static const uint8_t GPIOA  = 0x12;
+static const uint8_t GPIOB  = 0x13;
+
+// =====================================================
+// MAPOVANI LED A HALL SENZORU
+// x = 0 je pravy sloupec
+// y = 0 je dole
+// =====================================================
+
+// Mapovani hernich LED
+int ledIndex(int x, int y)
+{
+  if (x % 2 == 0) {
+    // Sudy sloupec jde odspodu nahoru
+    return x * LEDS_PER_COL + y * STEP;
+  } else {
+    // Lichy sloupec jde shora dolu
+    return x * LEDS_PER_COL + (ROWS - 1 - y) * STEP;
+  }
+}
+
+// Aktualni kotvy Hall mapovani
+static const int8_t HALL_BOTTOM_GP[6] = {  2, 13, 24, 23, 37, 45 };
+static const int8_t HALL_TOP_GP[6]    = {  7,  8, 29, 18, 32, 40 };
+
+int hallGlobalPin(int x, int y)
+{
+  int bottom = HALL_BOTTOM_GP[x];
+  int top    = HALL_TOP_GP[x];
+  int step   = (top > bottom) ? 1 : -1;
+
+  return bottom + y * step;
+}
+
+// =====================================================
+// GLOBALNI STAV
+// =====================================================
+
+Adafruit_NeoPixel strip(TOTAL_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Posledni nacteny stav jednotlivych expanderu
+uint16_t lastState[EXP_COUNT];
+
+// Jestli je expander pritomen
+bool expPresent[EXP_COUNT];
+
+// Stav jednotlivych poli 6x6
+bool sensorActive[COLS][ROWS];
+
+// Prevod globalPin -> souradnice x,y
+bool hasXY[48];
+uint8_t xyByGlobalPin[48][2];
+
+// =====================================================
+// I2C POMOCNE FUNKCE
+// =====================================================
+
+bool i2cPresent(uint8_t addr)
+{
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission(true) == 0;
+}
+
+bool writeReg(uint8_t addr, uint8_t reg, uint8_t value)
+{
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission(true) == 0;
+}
+
+bool readReg(uint8_t addr, uint8_t reg, uint8_t &value)
+{
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+
+  // Bez STOP, aby nasledovalo cteni stejneho zarizeni
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  int count = Wire.requestFrom((int)addr, 1, true);
+  if (count != 1) {
+    return false;
+  }
+
+  value = Wire.read();
+  return true;
+}
+
+bool readGPIO16(uint8_t addr, uint16_t &value)
+{
+  uint8_t a, b;
+
+  if (!readReg(addr, GPIOA, a)) {
+    return false;
+  }
+
+  if (!readReg(addr, GPIOB, b)) {
+    return false;
+  }
+
+  value = (uint16_t)a | ((uint16_t)b << 8);
+  return true;
+}
+
+bool initMCP(uint8_t addr)
+{
+  if (!i2cPresent(addr)) return false;
+
+  // Vsechny piny jako vstupy
+  if (!writeReg(addr, IODIRA, 0xFF)) return false;
+  if (!writeReg(addr, IODIRB, 0xFF)) return false;
+
+  // Zapnuti internich pull-up odporu
+  if (!writeReg(addr, GPPUA, 0xFF)) return false;
+  if (!writeReg(addr, GPPUB, 0xFF)) return false;
+
+  return true;
+}
+
+// =====================================================
+// LED VYKRESLOVANI
+// =====================================================
+
+// Pomala cervena pulzace pro neherni LED
+uint8_t redPulseValue()
+{
+  // Perioda cca 4 sekundy
+  float phase = (millis() % 4000) / 4000.0f;
+
+  // Trojuhelnikovy prubeh 0..1..0
+  float tri;
+  if (phase < 0.5f) {
+    tri = phase * 2.0f;
+  } else {
+    tri = (1.0f - phase) * 2.0f;
+  }
+
+  // Jemna cervena
+  return (uint8_t)(2 + tri * 16);
+}
+
+// Blikani aktivni oblasti
+bool blinkOn()
+{
+  // Perioda blikani 400 ms
+  return ((millis() / 200) % 2) == 0;
+}
+
+void renderLeds()
+{
+  strip.clear();
+
+  // Nejdriv nastavime vsechny fyzicke LED na jemnou cervenou pulzaci
+  uint8_t red = redPulseValue();
+
+  for (int i = 0; i < TOTAL_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(red, 0, 0));
+  }
+
+  // Potom rozsvitime vsechny herni LED standardne zelene
+  for (int x = 0; x < COLS; x++) {
+    for (int y = 0; y < ROWS; y++) {
+      int idx = ledIndex(x, y);
+      strip.setPixelColor(idx, strip.Color(0, 40, 0));
+    }
+  }
+
+  // Aktivni senzor -> blika herni LED + 2 nejblizsi fyzicke LED nahoru i dolu
+  for (int x = 0; x < COLS; x++) {
+    for (int y = 0; y < ROWS; y++) {
+      if (!sensorActive[x][y]) continue;
+
+      int idx = ledIndex(x, y);
+
+      for (int d = -2; d <= 2; d++) {
+        int ii = idx + d;
+        if (ii < 0 || ii >= TOTAL_LEDS) continue;
+
+        if (blinkOn()) {
+          strip.setPixelColor(ii, strip.Color(0, 80, 0));
+        } else {
+          strip.setPixelColor(ii, 0);
+        }
+      }
+    }
+  }
+
+  strip.show();
+}
+
+// =====================================================
+// AKTUALIZACE STAVU SENZORU
+// =====================================================
+
+void rebuildSensorStatesFromCurrentReads()
+{
+  // Nejdriv vse vynulujeme
+  for (int x = 0; x < COLS; x++) {
+    for (int y = 0; y < ROWS; y++) {
+      sensorActive[x][y] = false;
+    }
+  }
+
+  // Podle aktualniho stavu bitu z expanderu oznacime aktivni senzory
+  for (int e = 0; e < EXP_COUNT; e++) {
+    if (!expPresent[e]) continue;
+
+    uint16_t state = lastState[e];
+
+    for (uint8_t bit = 0; bit < 16; bit++) {
+      int gp = e * 16 + bit;
+
+      if (gp < 0 || gp >= 48) continue;
+      if (!hasXY[gp]) continue;
+
+      bool pinHigh = (state & (1u << bit)) != 0;
+      bool active = ACTIVE_LOW ? (!pinHigh) : pinHigh;
+
+      if (active) {
+        int x = xyByGlobalPin[gp][0];
+        int y = xyByGlobalPin[gp][1];
+        sensorActive[x][y] = true;
+      }
+    }
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  strip.begin();
+  strip.show();
+
+  Serial.println();
+  Serial.println("=== Test vsech senzoru a diod ===");
+  Serial.println("Herni LED sviti zelene.");
+  Serial.println("Aktivni senzor -> blika herni LED a 2 nejblizsi LED nad ni i pod ni.");
+  Serial.println("Neherni LED jemne pulzuji cervene.");
+  Serial.println();
+
+  // Priprava mapy globalPin -> (x,y)
+  for (int gp = 0; gp < 48; gp++) {
+    hasXY[gp] = false;
+  }
+
+  for (int x = 0; x < COLS; x++) {
+    for (int y = 0; y < ROWS; y++) {
+      int gp = hallGlobalPin(x, y);
+
+      if (gp >= 0 && gp < 48) {
+        hasXY[gp] = true;
+        xyByGlobalPin[gp][0] = (uint8_t)x;
+        xyByGlobalPin[gp][1] = (uint8_t)y;
+      }
+    }
+  }
+
+  // Inicializace expanderu
+  for (int e = 0; e < EXP_COUNT; e++) {
+    uint8_t addr = EXP_ADDRS[e];
+
+    expPresent[e] = initMCP(addr);
+
+    Serial.print("Expander 0x");
+    Serial.print(addr, HEX);
+    Serial.print(": ");
+
+    if (!expPresent[e]) {
+      Serial.println("nenalezen / nefunguje");
+      lastState[e] = 0xFFFF;
+      continue;
+    }
+
+    uint16_t state;
+    if (!readGPIO16(addr, state)) {
+      Serial.println("nelze precist");
+      expPresent[e] = false;
+      lastState[e] = 0xFFFF;
+      continue;
+    }
+
+    lastState[e] = state;
+    Serial.println("OK");
+  }
+
+  rebuildSensorStatesFromCurrentReads();
+  renderLeds();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  bool anythingChanged = false;
+
+  for (int e = 0; e < EXP_COUNT; e++) {
+    if (!expPresent[e]) continue;
+
+    uint16_t currentState;
+    if (!readGPIO16(EXP_ADDRS[e], currentState)) {
+      continue;
+    }
+
+    if (currentState != lastState[e]) {
+      lastState[e] = currentState;
+      anythingChanged = true;
+    }
+  }
+
+  if (anythingChanged) {
+    rebuildSensorStatesFromCurrentReads();
+  }
+
+  // Vykreslujeme porad, aby sla videt pulzace i blikani
+  renderLeds();
+
+  delay(20);
+}
