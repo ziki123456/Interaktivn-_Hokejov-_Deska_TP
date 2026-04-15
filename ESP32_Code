@@ -1,377 +1,1209 @@
-#include <Wire.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_GC9A01A.h>
 #include <Adafruit_NeoPixel.h>
+#include <Adafruit_MCP23X17.h>
+#include <Wire.h>
+#include <SPI.h>
 
-// =====================================================
-// ZAKLADNI NASTAVENI
-// =====================================================
+// --- PINY A KONFIGURACE ---
+// Definice všech použitých pinů ESP32 a základní konstanty.
+// Díky tomu se pak v kódu nepoužívají "holá čísla" a je hned vidět, co je připojené kam.
+#define TFT_SCLK 14
+#define TFT_MOSI 23
+#define TFT_CS   32
+#define TFT_DC   33
+#define TFT_RST  27
+#define LED_PIN  5
+#define BTN_UP   16
+#define BTN_DOWN 18
+#define BTN_SEL  17
+#define BUZZER   19
+#define NUM_LEDS 126
+#define DEMO_TIMEOUT 20000
 
-// I2C piny na ESP32
-static const int SDA_PIN = 21;
-static const int SCL_PIN = 22;
+// --- GLOBALNI PROMENNE ---
+// silentMode = tichý režim, kdy zařízení nevydává zvuky.
+bool silentMode = false;
 
-// Datovy pin LED pasku
-static const int LED_PIN = 5;
+// selectedGame = index právě vybrané hry v menu.
+int selectedGame = 0;
 
-// Hall senzory jsou aktivni v log. 0
-static const bool ACTIVE_LOW = true;
+// totalGames = celkový počet herních režimů.
+const int totalGames = 6;
 
-// =====================================================
-// GEOMETRIE DESKY
-// =====================================================
+// Pole názvů her, které se vypisují v menu.
+const char* gameNames[] = {"CLEAR THE ICE", "REFLEX", "DRIBBLE", "DIRTY ICE", "PENALTY", "BOMBER"};
 
-#define COLS 6
-#define ROWS 6
+// Pole rekordů pro jednotlivé hry.
+// U první hry se ukládá čas, u ostatních počet bodů.
+float records[6] = {99.9, 0, 0, 0, 0, 0};
 
-// Mezi hernimi LED jsou 3 neherni LED
-#define STEP 4
+// lastInputTime = kdy naposledy uživatel stiskl tlačítko.
+// stopToneTime = do kdy má pípat krátký tón.
+// demoHue = pomocná proměnná pro barevné efekty v demo módu.
+// lastUp/lastDown/lastSel = předchozí stav tlačítek kvůli detekci změny.
+unsigned long lastInputTime = 0;
+unsigned long stopToneTime = 0;
+uint16_t demoHue = 0;
+bool lastUp = HIGH, lastDown = HIGH, lastSel = HIGH;
 
-// V jednom sloupci je 21 fyzickych LED
-#define LEDS_PER_COL ((ROWS - 1) * STEP + 1)   // 21
+// Vytvoření objektů pro displej, LED pásek a 3 I/O expandéry MCP23017.
+Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_MCP23X17 mcp[3];
 
-// Celkem LED na desce
-#define TOTAL_LEDS (COLS * LEDS_PER_COL)       // 126
+// I2C adresy jednotlivých MCP expandérů.
+uint8_t mcpAddr[] = {0x20, 0x25, 0x24};
 
-// =====================================================
-// MCP23017
-// =====================================================
+// --- POMOCNE FUNKCE ---
 
-// Aktualni adresy expanderu
-static const uint8_t EXP_ADDRS[3] = { 0x20, 0x25, 0x24 };
-static const int EXP_COUNT = 3;
+// Funkce vrátí true, pokud je právě stisknuté aspoň jedno tlačítko.
+// Používám to třeba při čekání na uvolnění všech tlačítek.
+bool anyButtonPressed() {
+  return digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW || digitalRead(BTN_SEL) == LOW;
+}
 
-// Registry MCP23017
-static const uint8_t IODIRA = 0x00;
-static const uint8_t IODIRB = 0x01;
-static const uint8_t GPPUA  = 0x0C;
-static const uint8_t GPPUB  = 0x0D;
-static const uint8_t GPIOA  = 0x12;
-static const uint8_t GPIOB  = 0x13;
-
-// =====================================================
-// MAPOVANI LED A HALL SENZORU
-// x = 0 je pravy sloupec
-// y = 0 je dole
-// =====================================================
-
-// Mapovani hernich LED
-int ledIndex(int x, int y)
-{
-  if (x % 2 == 0) {
-    // Sudy sloupec jde odspodu nahoru
-    return x * LEDS_PER_COL + y * STEP;
-  } else {
-    // Lichy sloupec jde shora dolu
-    return x * LEDS_PER_COL + (ROWS - 1 - y) * STEP;
+// Tato funkce čeká, dokud uživatel nepustí konkrétní tlačítko.
+// Během čekání zároveň obsluhuje vypnutí tónu, aby zvuk nezůstal viset.
+void waitForRelease(int pin) {
+  while (digitalRead(pin) == LOW) {
+    checkTone();
+    delay(5);
   }
 }
 
-// Aktualni kotvy Hall mapovani
-static const int8_t HALL_BOTTOM_GP[6] = {  2, 13, 24, 23, 37, 45 };
-static const int8_t HALL_TOP_GP[6]    = {  7,  8, 29, 18, 32, 40 };
-
-int hallGlobalPin(int x, int y)
-{
-  int bottom = HALL_BOTTOM_GP[x];
-  int top    = HALL_TOP_GP[x];
-  int step   = (top > bottom) ? 1 : -1;
-
-  return bottom + y * step;
-}
-
-// =====================================================
-// GLOBALNI STAV
-// =====================================================
-
-Adafruit_NeoPixel strip(TOTAL_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-// Posledni nacteny stav jednotlivych expanderu
-uint16_t lastState[EXP_COUNT];
-
-// Jestli je expander pritomen
-bool expPresent[EXP_COUNT];
-
-// Stav jednotlivych poli 6x6
-bool sensorActive[COLS][ROWS];
-
-// Prevod globalPin -> souradnice x,y
-bool hasXY[48];
-uint8_t xyByGlobalPin[48][2];
-
-// =====================================================
-// I2C POMOCNE FUNKCE
-// =====================================================
-
-bool i2cPresent(uint8_t addr)
-{
-  Wire.beginTransmission(addr);
-  return Wire.endTransmission(true) == 0;
-}
-
-bool writeReg(uint8_t addr, uint8_t reg, uint8_t value)
-{
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  Wire.write(value);
-  return Wire.endTransmission(true) == 0;
-}
-
-bool readReg(uint8_t addr, uint8_t reg, uint8_t &value)
-{
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-
-  // Bez STOP, aby nasledovalo cteni stejneho zarizeni
-  if (Wire.endTransmission(false) != 0) {
-    return false;
+// Tato funkce čeká, dokud nejsou puštěná úplně všechna tlačítka.
+void waitAllButtonsRelease() {
+  while (anyButtonPressed()) {
+    checkTone();
+    delay(5);
   }
-
-  int count = Wire.requestFrom((int)addr, 1, true);
-  if (count != 1) {
-    return false;
-  }
-
-  value = Wire.read();
-  return true;
 }
 
-bool readGPIO16(uint8_t addr, uint16_t &value)
-{
-  uint8_t a, b;
-
-  if (!readReg(addr, GPIOA, a)) {
-    return false;
-  }
-
-  if (!readReg(addr, GPIOB, b)) {
-    return false;
-  }
-
-  value = (uint16_t)a | ((uint16_t)b << 8);
-  return true;
+// Přepočet logických souřadnic hrací plochy x,y na fyzický index LED v pásku.
+// Deska je zapojená hadovitě (serpentine), takže liché sloupce jsou obráceně.
+// V každém sloupci je fyzicky 21 LED a herní body jsou po 4 LED.
+int ledIndex(int x, int y) {
+  return (x % 2 == 0) ? (x * 21 + y * 4) : (x * 21 + (5 - y) * 4);
 }
 
-bool initMCP(uint8_t addr)
-{
-  if (!i2cPresent(addr)) return false;
-
-  // Vsechny piny jako vstupy
-  if (!writeReg(addr, IODIRA, 0xFF)) return false;
-  if (!writeReg(addr, IODIRB, 0xFF)) return false;
-
-  // Zapnuti internich pull-up odporu
-  if (!writeReg(addr, GPPUA, 0xFF)) return false;
-  if (!writeReg(addr, GPPUB, 0xFF)) return false;
-
-  return true;
+// Přepočet logických souřadnic x,y na globální pin Hall senzoru přes MCP expandéry.
+// Pole B a T obsahují spodní a horní kotvu každého sloupce.
+// Prostřední expandér je zapojený obráceně, takže se to musí dopočítat tímto způsobem.
+int hallGlobalPin(int x, int y) {
+  static const int8_t B[] = {2, 13, 24, 23, 37, 45};
+  static const int8_t T[] = {7, 8, 29, 18, 32, 40};
+  return B[x] + y * ((T[x] > B[x]) ? 1 : -1);
 }
 
-// =====================================================
-// LED VYKRESLOVANI
-// =====================================================
+// Krátké pípnutí přes buzzer.
+// f = frekvence tónu, d = délka tónu v ms.
+// Pokud je zapnutý tichý režim, funkce se hned ukončí.
+void startBeep(int f, int d) {
+  if (silentMode) return; // Pokud je ticho, hned skonči
+  tone(BUZZER, f);
+  stopToneTime = millis() + d;
+}
 
-// Pomala cervena pulzace pro neherni LED
-uint8_t redPulseValue()
-{
-  // Perioda cca 4 sekundy
-  float phase = (millis() % 4000) / 4000.0f;
-
-  // Trojuhelnikovy prubeh 0..1..0
-  float tri;
-  if (phase < 0.5f) {
-    tri = phase * 2.0f;
-  } else {
-    tri = (1.0f - phase) * 2.0f;
+// Kontrola, jestli už nemá být krátký tón vypnutý.
+// Funguje to tak, že startBeep tón spustí a tahle funkce ho později vypne.
+void checkTone() {
+  if (stopToneTime > 0 && millis() >= stopToneTime) {
+    noTone(BUZZER);
+    stopToneTime = 0;
   }
-
-  // Jemna cervena
-  return (uint8_t)(2 + tri * 16);
 }
 
-// Blikani aktivni oblasti
-bool blinkOn()
-{
-  // Perioda blikani 400 ms
-  return ((millis() / 200) % 2) == 0;
-}
+// --- MELODIE POPCORN (VITEZNA) ---
+// Tato funkce přehraje výherní melodii po vytvoření rekordu.
+void playPopcorn() {
+  int mel[] = {1319, 1175, 1319, 988, 784, 988, 659, 1319, 1175, 1319, 988, 784, 988, 659};
+  int dur[] = {125, 125, 125, 125, 125, 125, 250, 125, 125, 125, 125, 125, 125, 250};
 
-void renderLeds()
-{
-  strip.clear();
+  for (int i = 0; i < 14; i++) {
+    if(!silentMode) tone(BUZZER, mel[i], dur[i]);
+    delay(dur[i] * 1.2);
 
-  // Nejdriv nastavime vsechny fyzicke LED na jemnou cervenou pulzaci
-  uint8_t red = redPulseValue();
-
-  for (int i = 0; i < TOTAL_LEDS; i++) {
-    strip.setPixelColor(i, strip.Color(red, 0, 0));
-  }
-
-  // Potom rozsvitime vsechny herni LED standardne zelene
-  for (int x = 0; x < COLS; x++) {
-    for (int y = 0; y < ROWS; y++) {
-      int idx = ledIndex(x, y);
-      strip.setPixelColor(idx, strip.Color(0, 40, 0));
+    // Kdyby chtěl uživatel melodii přeskočit, může stisknout SELECT.
+    if (digitalRead(BTN_SEL) == LOW) {
+      noTone(BUZZER);
+      break;
     }
   }
 
-  // Aktivni senzor -> blika herni LED + 2 nejblizsi fyzicke LED nahoru i dolu
-  for (int x = 0; x < COLS; x++) {
-    for (int y = 0; y < ROWS; y++) {
-      if (!sensorActive[x][y]) continue;
+  noTone(BUZZER);
+}
 
-      int idx = ledIndex(x, y);
+// --- MELODIE PRO PROHRU (STAR WARS - IMPERIAL MARCH) ---
+// Tato funkce přehraje melodii při konci hry bez rekordu.
+void playImperialMarch() {
+  int mel[] = {440, 440, 440, 349, 523, 440, 349, 523, 440};
+  int dur[] = {500, 500, 500, 350, 150, 500, 350, 150, 650};
 
-      for (int d = -2; d <= 2; d++) {
-        int ii = idx + d;
-        if (ii < 0 || ii >= TOTAL_LEDS) continue;
+  for (int i = 0; i < 9; i++) {
+    if(!silentMode) tone(BUZZER, mel[i], dur[i]);
+    delay(dur[i] * 1.1);
 
-        if (blinkOn()) {
-          strip.setPixelColor(ii, strip.Color(0, 80, 0));
+    if (digitalRead(BTN_SEL) == LOW) {
+      noTone(BUZZER);
+      break;
+    }
+  }
+
+  noTone(BUZZER);
+}
+
+// --- ODPOCOVANI ---
+// Společná funkce, která před spuštěním hry zobrazí 3, 2, 1, START!
+void countdown() {
+  strip.clear();
+  strip.show();
+
+  for (int i = 3; i > 0; i--) {
+    tft.fillScreen(GC9A01A_BLACK);
+    tft.setTextSize(8);
+    tft.setTextColor(GC9A01A_YELLOW);
+    tft.setCursor(95, 85);
+    tft.print(i);
+
+    if (!silentMode) tone(BUZZER, 800, 200);
+    delay(1000);
+  }
+
+  tft.fillScreen(GC9A01A_BLACK);
+  tft.setTextSize(5);
+  tft.setTextColor(GC9A01A_GREEN);
+  tft.setCursor(45, 100);
+  tft.print("START!");
+  if (!silentMode) tone(BUZZER, 1200, 400);
+  delay(600);
+
+  tft.fillScreen(GC9A01A_BLACK);
+  strip.clear();
+  strip.show();
+}
+
+// --- UI SYSTEM ---
+
+// Pomocná funkce pro vykreslení oblouku z jednotlivých pixelů.
+// Používám ji v menu pro indikaci tichého režimu.
+void drawArc(int x, int y, int r, int startAngle, int endAngle, uint16_t color) {
+  for (int i = startAngle; i <= endAngle; i++) {
+    float rad = i * 3.14159 / 180.0;
+    int px = x + cos(rad) * r;
+    int py = y + sin(rad) * r;
+    tft.drawPixel(px, py, color);
+  }
+}
+
+// Vykreslení hlavního menu.
+// Uprostřed je právě vybraná hra, nahoře a dole sousední položky.
+// Zároveň se tu zobrazuje nejlepší výsledek pro danou hru.
+void drawMenu() {
+  tft.fillScreen(GC9A01A_BLACK);
+  tft.drawCircle(120, 120, 117, 0x4208);
+
+  if (silentMode) {
+      // Vykreslíme 3 oblouky pod sebou, aby byla čára tlustší a lépe vidět
+      for (int thickness = 0; thickness < 3; thickness++) {
+        // Parametry: střed X, střed Y, poloměr, úhel od, úhel do, barva
+        // Úhly 60 až 120 stupňů vykreslí oblouk přesně dole
+        drawArc(120, 120, 110 - thickness, 60, 120, GC9A01A_RED);
+      }
+    }
+
+  for (int i = -1; i <= 1; i++) {
+    int idx = (selectedGame + i + totalGames) % totalGames;
+    int yPos = 120 + (i * 75);
+
+    if (i == 0) {
+      tft.setTextSize(3);
+      tft.setTextColor(GC9A01A_GREEN);
+
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(gameNames[idx], 0, 0, &x1, &y1, &w, &h);
+      tft.setCursor(120 - (w / 2), yPos - 25);
+      tft.print(gameNames[idx]);
+
+      tft.drawFastHLine(70, yPos + 5, 100, 0x7BEF);
+
+      tft.setTextSize(2);
+      tft.setTextColor(0xFD20);
+      tft.setCursor(65, yPos + 18);
+      tft.print("BEST:");
+
+      tft.setTextColor(GC9A01A_WHITE);
+      tft.setCursor(130, yPos + 18);
+
+      // U první hry se vypisuje rekordní čas, u ostatních počet bodů.
+      if (idx == 0) {
+        if (records[idx] > 98) {
+          tft.print("--.-s");
         } else {
-          strip.setPixelColor(ii, 0);
+          tft.print(records[idx], 1);
+          tft.print("s");
+        }
+      } else {
+        tft.print((int)records[idx]);
+        tft.print(" b");
+      }
+    } else {
+      tft.setTextSize(2);
+      tft.setTextColor(0x7BEF);
+
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(gameNames[idx], 0, 0, &x1, &y1, &w, &h);
+      tft.setCursor(120 - (w / 2), yPos - 10);
+      tft.print(gameNames[idx]);
+    }
+  }
+}
+
+// Společné vyhodnocení výsledku po skončení hry.
+// Funkce zjistí, jestli padl rekord, vypíše výsledek a přehraje odpovídající melodii.
+void handleResult(float res, int idx) {
+  noTone(BUZZER);
+  strip.clear();
+  strip.show();
+  tft.fillScreen(GC9A01A_BLACK);
+
+  bool isRec = (idx == 0) ? (res < records[idx]) : (res > records[idx]);
+
+  if (isRec) {
+    records[idx] = res;
+
+    tft.setTextColor(GC9A01A_CYAN);
+    tft.setTextSize(3);
+    tft.setCursor(55, 70);
+    tft.print("REKORD!");
+
+    tft.setCursor(95, 120);
+    tft.setTextColor(GC9A01A_WHITE);
+
+    if (idx == 0) {
+      tft.print(res, 1);
+    } else {
+      tft.print((int)res);
+    }
+
+    playPopcorn();
+  } else {
+    tft.setTextColor(GC9A01A_RED);
+    tft.setTextSize(3);
+    tft.setCursor(75, 70);
+    tft.print("KONEC");
+
+    tft.setCursor(95, 120);
+    tft.setTextColor(GC9A01A_WHITE);
+
+    if (idx == 0) {
+      tft.print(res, 1);
+    } else {
+      tft.print((int)res);
+    }
+
+    playImperialMarch();
+  }
+
+  delay(500);
+  waitForRelease(BTN_SEL);
+}
+
+// --- HERNI LOGIKY ---
+
+// Hra 1: hráč má co nejrychleji zhasnout všech 36 aktivních bodů.
+void gameZhasniVse() {
+  countdown();
+
+  bool active[6][6];
+  for (int x = 0; x < 6; x++) {
+    for (int y = 0; y < 6; y++) {
+      active[x][y] = true;
+      strip.setPixelColor(ledIndex(x, y), 0x0000AA);
+    }
+  }
+  strip.show();
+
+  int rem = 36;
+  unsigned long start = millis();
+  unsigned long lastDispUpdate = 0;
+
+  while (rem > 0) {
+    checkTone();
+    if (digitalRead(BTN_SEL) == LOW) return;
+
+    // Načtení všech 3 expandérů najednou.
+    uint16_t m[3] = {mcp[0].readGPIOAB(), mcp[1].readGPIOAB(), mcp[2].readGPIOAB()};
+    bool changed = false;
+
+    for (int x = 0; x < 6; x++) {
+      for (int y = 0; y < 6; y++) {
+        if (active[x][y]) {
+          int gp = hallGlobalPin(x, y);
+          if (!(m[gp / 16] & (1 << (gp % 16)))) {
+            active[x][y] = false;
+            strip.setPixelColor(ledIndex(x, y), 0);
+            rem--;
+            startBeep(1200, 15);
+            changed = true;
+          }
+        }
+      }
+    }
+
+    // LED pásek překresluju jen když se něco opravdu změnilo.
+    if (changed) {
+      strip.show();
+    }
+
+    // Na displeji zobrazuju průběžný čas.
+    if (millis() - lastDispUpdate > 120) {
+      tft.setCursor(80, 105);
+      tft.setTextSize(4);
+      tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+      tft.print((millis() - start) / 1000.0, 1);
+      lastDispUpdate = millis();
+    }
+  }
+
+  handleResult((millis() - start) / 1000.0, 0);
+}
+
+// Hra 2: reflexní hra s hlavním cílem a náhodnými bonusy.
+void gamePostrehVylepseny() {
+  countdown();
+
+  int score = 0;
+  unsigned long gameDuration = 60000;
+  unsigned long gS = millis();
+  unsigned long lastDisp = 0;
+
+  // lastX,lastY = předchozí cíl, aby nový neležel na stejném místě.
+  int lastX = -1, lastY = -1;
+  int targetX = random(6), targetY = random(6);
+
+  // Proměnné pro bonus.
+  int bonusX = -1, bonusY = -1;
+  uint32_t bonusColor = 0;
+  int bonusType = -1;
+  unsigned long bonusSpawnTime = 0;
+
+  while (millis() - gS < gameDuration) {
+    checkTone();
+    if (digitalRead(BTN_SEL) == LOW) return;
+
+    // Vždy vykreslím hlavní cíl a případný bonus.
+    strip.clear();
+    strip.setPixelColor(ledIndex(targetX, targetY), 0xFF0000);
+
+    if (bonusType != -1) {
+      if (millis() - bonusSpawnTime < 1500) {
+        strip.setPixelColor(ledIndex(bonusX, bonusY), bonusColor);
+      } else {
+        bonusType = -1;
+      }
+    }
+    strip.show();
+
+    // Aktualizace displeje se skóre a odpočtem času.
+    if (millis() - lastDisp > 200) {
+      tft.setCursor(40, 70);
+      tft.setTextSize(3);
+      tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+      tft.print("BODY: ");
+      tft.print(score);
+
+      long remaining = (gameDuration - (millis() - gS)) / 1000;
+
+      tft.setCursor(95, 120);
+      tft.setTextSize(6);
+      tft.setTextColor(GC9A01A_YELLOW, GC9A01A_BLACK);
+      tft.print(remaining > 0 ? remaining : 0);
+      tft.print("  ");
+
+      lastDisp = millis();
+    }
+
+    uint16_t d[3] = {mcp[0].readGPIOAB(), mcp[1].readGPIOAB(), mcp[2].readGPIOAB()};
+
+    // Kontrola zásahu hlavního červeného cíle.
+    int redGP = hallGlobalPin(targetX, targetY);
+    if (!(d[redGP / 16] & (1 << (redGP % 16)))) {
+      score += 1;
+      startBeep(1200, 20);
+
+      lastX = targetX;
+      lastY = targetY;
+      while (targetX == lastX && targetY == lastY) {
+        targetX = random(6);
+        targetY = random(6);
+      }
+
+      // S pravděpodobností 1/3 se po zásahu hlavního cíle objeví bonus
+      if (random(3) == 0) {
+        // Náhodně vybereme souřadnici bonusu
+        bonusX = random(6);
+        bonusY = random(6);
+
+        // Bonus nesmí být:
+        // 1) na právě novém hlavním cíli
+        // 2) na předchozím hlavním cíli
+        while ((bonusX == targetX && bonusY == targetY) || (bonusX == lastX && bonusY == lastY)) {
+          bonusX = random(6);
+          bonusY = random(6);
+        }
+
+        // Náhodný výběr typu bonusu v procentech 0-99
+        int bPick = random(100);
+
+        if (bPick < 25) {
+          // ZELENÝ bonus
+          // bonusType = 0
+          // efekt: spustí "multi-hit" bonus,
+          // tedy rozsvítí více červených polí najednou, která může hráč rychle sbírat za body
+          bonusColor = 0x00FF00;
+          bonusType = 0;
+
+        } else if (bPick < 50) {
+          // ŽLUTÝ bonus
+          // bonusType = 1
+          // efekt: přidá +5 bodů
+          bonusColor = 0xFFFF00;
+          bonusType = 1;
+
+        } else if (bPick < 65) {
+          // MODRÝ bonus
+          // bonusType = 2
+          // efekt: přidá +5 sekund k celkovému času hry
+          bonusColor = 0x0000FF;
+          bonusType = 2;
+
+        } else {
+          // FIALOVÝ bonus
+          // bonusType = 3
+          // efekt: ubere 5 sekund z celkového času hry
+          // je to tedy naopak záporný bonus / penalizace
+          bonusColor = 0xFF00FF;
+          bonusType = 3;
+        }
+
+        bonusSpawnTime = millis();
+      } else {
+        bonusType = -1;
+      }
+    }
+
+    // Vyhodnocení zásahu bonusu, pokud je právě aktivní.
+    if (bonusType != -1 && (millis() - bonusSpawnTime < 1500)) {
+      int bonGP = hallGlobalPin(bonusX, bonusY);
+      if (!(d[bonGP / 16] & (1 << (bonGP % 16)))) {
+        int currentBonus = bonusType;
+        bonusType = -1;
+
+        strip.clear();
+        strip.show();
+
+        lastX = targetX;
+        lastY = targetY;
+        while (targetX == lastX && targetY == lastY) {
+          targetX = random(6);
+          targetY = random(6);
+        }
+
+        // Žlutý bonus = +5 bodů.
+        if (currentBonus == 1) {
+          score += 5;
+          startBeep(1800, 50);
+        } else if (currentBonus == 2) {
+          // Modrý bonus = +5 sekund.
+          gameDuration += 5000;
+          startBeep(2200, 80);
+        } else if (currentBonus == 3) {
+          // Fialový bonus = -5 sekund a navíc trestná animace.
+          if (gameDuration > 5000) gameDuration -= 5000;
+          startBeep(150, 400);
+
+          for (int h = 0; h < NUM_LEDS; h++) {
+            strip.clear();
+            strip.setPixelColor(h, 0x440044);
+            if (h > 0) strip.setPixelColor(h - 1, 0x220022);
+            strip.show();
+            delay(35);
+          }
+
+        } else if (currentBonus == 0) {
+                  // Zelený bonus = speciální bonusová minihra na rychlé sbírání 10 bodů.
+                  startBeep(800, 40);
+
+                  // 1. Vytvoříme seznam všech indexů (0 až 35)
+                  int8_t positions[36];
+                  for (int i = 0; i < 36; i++) positions[i] = i;
+
+                  // 2. Fisher-Yates shuffle (rychlé zamíchání pole)
+                  // Stačí nám prohodit jen prvních 10, zbytek nás nezajímá
+                  for (int i = 0; i < 10; i++) {
+                    int j = random(i, 36);
+                    int8_t temp = positions[i];
+                    positions[i] = positions[j];
+                    positions[j] = temp;
+                  }
+
+                  // 3. Rozsvítíme prvních 10 zamíchaných pozic
+                  bool rA[10];
+                  int rX[10], rY[10];
+
+                  for (int r = 0; r < 10; r++) {
+                    rX[r] = positions[r] / 6; // Přepočet indexu na X
+                    rY[r] = positions[r] % 6; // Přepočet indexu na Y
+                    
+                    // Pokud by náhodou padla pozice hlavního cíle, posuneme se v poli dál
+                    if (rX[r] == targetX && rY[r] == targetY) {
+                      // Jednoduchý trik: vezmeme 11. pozici ze seznamu místo téhle
+                      rX[r] = positions[10] / 6;
+                      rY[r] = positions[10] % 6;
+                    }
+
+                    rA[r] = true;
+                    strip.setPixelColor(ledIndex(rX[r], rY[r]), 0xFF0000);
+                  }
+                  strip.show();
+
+
+
+
+
+          int hits = 0;
+          unsigned long expStart = millis();
+
+          while (hits < 10 && millis() - expStart < 8000) {
+            uint16_t m[3] = {mcp[0].readGPIOAB(), mcp[1].readGPIOAB(), mcp[2].readGPIOAB()};
+
+            for (int r = 0; r < 10; r++) {
+              if (rA[r]) {
+                int gp = hallGlobalPin(rX[r], rY[r]);
+                if (!(m[gp / 16] & (1 << (gp % 16)))) {
+                  rA[r] = false;
+                  strip.setPixelColor(ledIndex(rX[r], rY[r]), 0);
+                  strip.show();
+                  hits++;
+                  score++;
+                  if (!silentMode) tone(BUZZER, 1000 + (hits * 150), 40);
+                  delay(50);
+                }
+              }
+            }
+
+            if (digitalRead(BTN_SEL) == LOW) return;
+          }
         }
       }
     }
   }
 
-  strip.show();
+  handleResult(score, 1);
 }
 
-// =====================================================
-// AKTUALIZACE STAVU SENZORU
-// =====================================================
+// Hra 3: driblování z jedné strany na druhou.
+// Hráč střídavě trefuje levou a pravou stranu a snaží se udělat co nejvíc zásahů za čas.
+void gameDriblovani() {
+  countdown();
 
-void rebuildSensorStatesFromCurrentReads()
-{
-  // Nejdriv vse vynulujeme
-  for (int x = 0; x < COLS; x++) {
-    for (int y = 0; y < ROWS; y++) {
-      sensorActive[x][y] = false;
-    }
-  }
+  int score = 0, side = 0;
+  unsigned long gameDuration = 30000;
+  unsigned long gS = millis();
+  unsigned long lastTimeUpdate = 0;
 
-  // Podle aktualniho stavu bitu z expanderu oznacime aktivni senzory
-  for (int e = 0; e < EXP_COUNT; e++) {
-    if (!expPresent[e]) continue;
+  while (millis() - gS < gameDuration) {
+    checkTone();
+    if (digitalRead(BTN_SEL) == LOW) return;
 
-    uint16_t state = lastState[e];
+    // Cíl je střídavě vlevo a vpravo.
+    int tx = (side == 0) ? 5 : 0;
 
-    for (uint8_t bit = 0; bit < 16; bit++) {
-      int gp = e * 16 + bit;
+    // Barva se během hry mění od zelené do červené podle ubíhajícího času.
+    unsigned long elapsed = millis() - gS;
+    float progress = (float)elapsed / gameDuration;
+    uint8_t r = 255 * progress;
+    uint8_t g = 255 * (1.0 - progress);
+    uint32_t currentColor = strip.Color(r, g, 0);
 
-      if (gp < 0 || gp >= 48) continue;
-      if (!hasXY[gp]) continue;
+    tft.setCursor(40, 80);
+    tft.setTextSize(3);
+    tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+    tft.print("HITY: ");
+    tft.print(score);
 
-      bool pinHigh = (state & (1u << bit)) != 0;
-      bool active = ACTIVE_LOW ? (!pinHigh) : pinHigh;
+    tft.setCursor(55, 130);
+    tft.setTextSize(2);
+    tft.setTextColor(currentColor, GC9A01A_BLACK);
+    tft.print("CAS: ");
+    long remaining = (gameDuration - elapsed) / 1000;
+    tft.print(remaining > 0 ? remaining : 0);
+    tft.print("s ");
 
-      if (active) {
-        int x = xyByGlobalPin[gp][0];
-        int y = xyByGlobalPin[gp][1];
-        sensorActive[x][y] = true;
+    while (true) {
+      checkTone();
+      if (digitalRead(BTN_SEL) == LOW) return;
+      if (millis() - gS >= gameDuration) break;
+
+      unsigned long innerElapsed = millis() - gS;
+      float innerProgress = (float)innerElapsed / gameDuration;
+      uint32_t innerColor = strip.Color(255 * innerProgress, 255 * (1.0 - innerProgress), 0);
+
+      strip.clear();
+      strip.setPixelColor(ledIndex(tx, 3), innerColor);
+      strip.show();
+
+      uint16_t d[3] = {mcp[0].readGPIOAB(), mcp[1].readGPIOAB(), mcp[2].readGPIOAB()};
+      if (!(d[hallGlobalPin(tx, 3) / 16] & (1 << (hallGlobalPin(tx, 3) % 16)))) {
+        score++;
+        side = 1 - side;
+        startBeep(2000, 20);
+        delay(100);
+        break;
+      }
+
+      if (millis() - lastTimeUpdate > 200) {
+        tft.setCursor(105, 130);
+        tft.setTextColor(innerColor, GC9A01A_BLACK);
+        tft.print((gameDuration - innerElapsed) / 1000);
+        tft.print("s ");
+        lastTimeUpdate = millis();
       }
     }
   }
+
+  handleResult(score, 2);
 }
 
-// =====================================================
-// SETUP
-// =====================================================
+// Hra 4: Dirty Ice.
+// Postupně se rozsvěcují červené body a hráč je musí čistit.
+// Hra je schválně udělaná tak, že se postupně zrychluje a dřív nebo později hráč nestíhá.
+void gameDirtyIce() {
+  countdown();
 
-void setup()
-{
-  Serial.begin(115200);
-  delay(500);
+  int sc = 0;
+  int redCount = 0;
+  bool ledState[6][6];
+  for (int x = 0; x < 6; x++) {
+    for (int y = 0; y < 6; y++) {
+      ledState[x][y] = false;
+    }
+  }
 
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);
+  unsigned long gameStart = millis();
+  unsigned long lastSpawn = 0;
+  unsigned long lastDispUpdate = 0;
+  bool ledsDirty = true;
+
+  // AGRESIVNĚJŠÍ NASTAVENÍ OBTÍŽNOSTI
+  const unsigned long START_INTERVAL = 1100; // Začínáme rychleji (1.1s)
+  const unsigned long END_INTERVAL   = 50;  // Tohle už skoro nejde stíhat
+  const unsigned long RAMP_TIME      = 60000; // Vše se rozhodne během 60 sekund
+
+  // NIŽŠÍ JAS PRO STABILITU (proti problikávání)
+  const uint32_t COLOR_RED_ACTIVE = 0x400000; // Ještě o kousek méně (stále dost rudá)
+  const uint32_t COLOR_IDLE       = 0x000200; // Jen symbolická zelená
+
+  strip.clear();
+  strip.show(); // Vyčistit hned na začátku
+
+  while (true) {
+    checkTone();
+    if (digitalRead(BTN_SEL) == LOW) return;
+
+    unsigned long now = millis();
+    unsigned long elapsed = now - gameStart;
+
+    // Lineární zkracování (každou milisekundu se hra malinko zrychlí)
+    unsigned long spawnInterval;
+    if (elapsed >= RAMP_TIME) {
+      spawnInterval = END_INTERVAL;
+    } else {
+      spawnInterval = START_INTERVAL - ((START_INTERVAL - END_INTERVAL) * elapsed) / RAMP_TIME;
+    }
+
+    // Spawn nové špíny
+    if (now - lastSpawn >= spawnInterval) {
+      lastSpawn = now;
+      int freeCount = 36 - redCount;
+      if (freeCount > 0) {
+        int pick = random(freeCount);
+        int idx = 0;
+        for (int x = 0; x < 6; x++) {
+          for (int y = 0; y < 6; y++) {
+            if (!ledState[x][y]) {
+              if (idx == pick) {
+                ledState[x][y] = true;
+                redCount++;
+                ledsDirty = true;
+                x = 6; break; // Vyskočit z cyklů
+              }
+              idx++;
+            }
+          }
+        }
+      }
+    }
+
+    // RYCHLÉ ČTENÍ SENZORŮ (Priorita č. 1)
+    uint16_t m[3] = {mcp[0].readGPIOAB(), mcp[1].readGPIOAB(), mcp[2].readGPIOAB()};
+    bool hitDetected = false;
+
+    for (int x = 0; x < 6; x++) {
+      for (int y = 0; y < 6; y++) {
+        if (!ledState[x][y]) continue; 
+
+        int gp = hallGlobalPin(x, y);
+        if (!(m[gp / 16] & (1 << (gp % 16)))) {
+          ledState[x][y] = false;
+          redCount--;
+          sc++;
+          ledsDirty = true;
+          hitDetected = true;
+        }
+      }
+    }
+
+    if (hitDetected) {
+      startBeep(2100, 8);
+    }
+
+    // VYKRESLOVÁNÍ (Jen když je potřeba a s ochranou proti rušení)
+    if (ledsDirty) {
+      for (int x = 0; x < 6; x++) {
+        for (int y = 0; y < 6; y++) {
+          strip.setPixelColor(ledIndex(x, y), ledState[x][y] ? COLOR_RED_ACTIVE : COLOR_IDLE);
+        }
+      }
+      
+      // Malá finta: I2C komunikace mohl nechat "šum" na linkách. 
+      // Krátká pauza před show() někdy pomůže ESP32 stabilizovat piny.
+      delayMicroseconds(50); 
+      strip.show();
+      ledsDirty = false;
+    }
+
+    // Displej - méně často, aby nebrzdil čtení senzorů
+    if (now - lastDispUpdate >= 150) {
+      tft.setCursor(45, 80);
+      tft.setTextSize(3);
+      tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+      tft.print("SCORE: "); tft.print(sc);
+      tft.print("  "); 
+
+      tft.setCursor(55, 130);
+      tft.setTextSize(2);
+      tft.setTextColor(redCount < 15 ? 0x07E0 : GC9A01A_RED, GC9A01A_BLACK);
+      tft.print("DIRT: "); tft.print(redCount);
+      tft.print("/18  ");
+      lastDispUpdate = now;
+    }
+
+    if (redCount >= 18) {
+      // KONEC HRY
+      startBeep(60, 600);
+      tft.fillScreen(GC9A01A_RED);
+      tft.setCursor(35, 105);
+      tft.setTextSize(3);
+      tft.setTextColor(GC9A01A_WHITE);
+      tft.print("DIRTY ICE!");
+      delay(2000);
+      break;
+    }
+    
+    // Žádný delay(5), chceme maximální rychlost smyčky!
+  }
+
+  handleResult(sc, 3);
+}
+
+
+// Hra 5: nájezd na branku.
+// Dole je pohyblivý brankář a shora padá puk. Hráč musí puk chytit.
+void gameNajezd() {
+  countdown();
+
+  int sc = 0;
+  float spd = 200;
+  int goalieX = 2;
+
+  while (true) {
+    int px = random(6);
+    int py = 0;
+    bool caught = false;
+
+    tft.setCursor(60, 110);
+    tft.setTextSize(4);
+    tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+    tft.print(sc);
+
+    while (py < 6) {
+      checkTone();
+      if (digitalRead(BTN_SEL) == LOW) return;
+
+      // Na poslední řadě se z Hall senzorů čte pozice brankáře.
+      uint16_t m[3] = {mcp[0].readGPIOAB(), mcp[1].readGPIOAB(), mcp[2].readGPIOAB()};
+      for (int x = 0; x < 6; x++) {
+        int gp = hallGlobalPin(x, 5);
+        if (!(m[gp / 16] & (1 << (gp % 16)))) {
+          goalieX = x;
+        }
+      }
+
+      // Vykreslení brankáře a puku.
+      strip.clear();
+      strip.setPixelColor(ledIndex(goalieX, 5), 0x0000FF);
+      if (goalieX > 0) strip.setPixelColor(ledIndex(goalieX - 1, 5), 0x000044);
+      if (goalieX < 5) strip.setPixelColor(ledIndex(goalieX + 1, 5), 0x000044);
+      strip.setPixelColor(ledIndex(px, py), 0xFFFFFF);
+      strip.show();
+
+      if (py == 5 && goalieX == px) {
+        caught = true;
+        break;
+      }
+
+      unsigned long stepStart = millis();
+      while (millis() - stepStart < spd) {
+        uint16_t mIn[3] = {mcp[0].readGPIOAB(), mcp[1].readGPIOAB(), mcp[2].readGPIOAB()};
+        for (int x = 0; x < 6; x++) {
+          int gp = hallGlobalPin(x, 5);
+          if (!(mIn[gp / 16] & (1 << (gp % 16)))) {
+            if (goalieX != x) {
+              goalieX = x;
+
+              strip.clear();
+              strip.setPixelColor(ledIndex(goalieX, 5), 0x0000FF);
+              if (goalieX > 0) strip.setPixelColor(ledIndex(goalieX - 1, 5), 0x000044);
+              if (goalieX < 5) strip.setPixelColor(ledIndex(goalieX + 1, 5), 0x000044);
+              strip.setPixelColor(ledIndex(px, py), 0xFFFFFF);
+              strip.show();
+            }
+          }
+        }
+
+        if (digitalRead(BTN_SEL) == LOW) return;
+      }
+
+      py++;
+    }
+
+    if (caught) {
+      sc++;
+      spd *= 0.96;
+      startBeep(1800, 15);
+      strip.setPixelColor(ledIndex(px, 5), 0x00FF00);
+      strip.show();
+      delay(150);
+    } else {
+      startBeep(80, 400);
+      for (int i = 0; i < 3; i++) {
+        strip.fill(0x550000);
+        strip.show();
+        delay(80);
+        strip.clear();
+        strip.show();
+        delay(80);
+      }
+      break;
+    }
+  }
+
+  handleResult(sc, 4);
+}
+
+// Hra 6: Bombardák.
+// Náhodně se objevují zelené cíle a červené bomby.
+// Zelené se mají trefovat, bomby se mají naopak nechat být.
+void gameBombardak() {
+  countdown();
+
+  int sc = 0;
+  unsigned long gameDuration = 30000;
+  unsigned long gameStart = millis();
+  unsigned long lastTimeUpdate = 0;
+
+  while (millis() - gameStart < gameDuration) {
+    checkTone();
+    if (digitalRead(BTN_SEL) == LOW) return;
+
+    int rx = random(6), ry = random(6);
+    bool isBomba = (random(100) < 30);
+
+    strip.clear();
+    if (isBomba) {
+      strip.setPixelColor(ledIndex(rx, ry), 0xFF0000);
+    } else {
+      strip.setPixelColor(ledIndex(rx, ry), 0x00FF00);
+    }
+    strip.show();
+
+    tft.setCursor(40, 80);
+    tft.setTextSize(3);
+    tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+    tft.print("SKORE: ");
+    tft.print(sc);
+
+    tft.setCursor(55, 130);
+    tft.setTextSize(2);
+    tft.setTextColor(0x7BEF, GC9A01A_BLACK);
+    tft.print("CAS: ");
+    long remaining = (gameDuration - (millis() - gameStart)) / 1000;
+    tft.print(remaining > 0 ? remaining : 0);
+    tft.print("s ");
+
+    unsigned long spawnTime = millis();
+    bool hit = false;
+
+    while (millis() - spawnTime < 1000) {
+      checkTone();
+      if (digitalRead(BTN_SEL) == LOW) return;
+      if (millis() - gameStart >= gameDuration) break;
+
+      uint16_t d[3] = {mcp[0].readGPIOAB(), mcp[1].readGPIOAB(), mcp[2].readGPIOAB()};
+      if (!(d[hallGlobalPin(rx, ry) / 16] & (1 << (hallGlobalPin(rx, ry) % 16)))) {
+        hit = true;
+        break;
+      }
+
+      if (millis() - lastTimeUpdate > 200) {
+        tft.setCursor(105, 130);
+        long r = (gameDuration - (millis() - gameStart)) / 1000;
+        tft.print(r > 0 ? r : 0);
+        tft.print("s ");
+        lastTimeUpdate = millis();
+      }
+    }
+
+    if (isBomba) {
+      if (hit) {
+        sc -= 3;
+        startBeep(150, 40);
+        tft.fillScreen(GC9A01A_RED);
+        delay(40);
+        tft.fillScreen(GC9A01A_BLACK);
+      } else {
+        sc += 1;
+        startBeep(3500, 5);
+      }
+    } else {
+      if (hit) {
+        sc += 2;
+        startBeep(2100, 8);
+      }
+    }
+
+    strip.clear();
+    strip.show();
+
+    delay(random(150, 450));
+  }
+
+  handleResult(sc, 5);
+}
+
+// --- DEMO MOD ---
+// Tento režim se spustí po určité době nečinnosti a slouží jako ukázka zařízení.
+void runDemoMode() {
+  tft.fillScreen(0);
+  float ang = 0;
+  int x = 40, y = 100, dx = 2, dy = 1;
+  int currentEffect = 0;
+  unsigned long lastSwitch = millis();
+
+  while (true) {
+    if (anyButtonPressed()) {
+      strip.clear();
+      strip.show();
+      waitAllButtonsRelease();
+      return;
+    }
+
+    // Každých 15 sekund přepnutí na další efekt.
+    if (millis() - lastSwitch > 15000) {
+      currentEffect = (currentEffect + 1) % 5;
+      lastSwitch = millis();
+      tft.fillScreen(0);
+      strip.clear();
+    }
+
+    // Pohybující se nápis HOCKEY na displeji.
+    tft.setCursor(x, y);
+    tft.setTextColor(0);
+    tft.setTextSize(3);
+    tft.print("HOCKEY");
+
+    x += dx;
+    y += dy;
+    if (x < 30 || x > 130) dx *= -1;
+    if (y < 50 || y > 170) dy *= -1;
+
+    // Rotující body kolem displeje.
+    for (int i = 0; i < 8; i++) {
+      float a = ang + (i * PI / 4);
+      tft.fillCircle(120 + cos(a) * 100, 120 + sin(a) * 100, 4, (i % 2) ? GC9A01A_RED : GC9A01A_YELLOW);
+    }
+    ang += 0.05;
+
+    tft.setCursor(x, y);
+    tft.setTextColor((millis() / 500 % 2) ? GC9A01A_YELLOW : GC9A01A_WHITE);
+    tft.print("HOCKEY");
+
+    // Přepínání mezi 5 světelnými efekty na LED pásku.
+    if (currentEffect == 0) {
+      for (int i = 0; i < NUM_LEDS; i++) {
+        strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(demoHue + (i * 500), 255, 100)));
+      }
+      demoHue += 400;
+    } else if (currentEffect == 1) {
+      strip.clear();
+      int head = (millis() / 40) % NUM_LEDS;
+      for (int i = 0; i < 15; i++) {
+        int pos = (head - i + NUM_LEDS) % NUM_LEDS;
+        strip.setPixelColor(pos, strip.Color(0, 255 - (i * 15), 100));
+      }
+    } else if (currentEffect == 2) {
+      if (random(10) == 1) {
+        strip.setPixelColor(random(NUM_LEDS), strip.Color(random(100, 255), random(100, 255), 0));
+      }
+      for (int i = 0; i < NUM_LEDS; i++) {
+        uint32_t c = strip.getPixelColor(i);
+        strip.setPixelColor(i, strip.Color((uint8_t)((c >> 16) * 0.9), (uint8_t)((c >> 8) * 0.9), 0));
+      }
+    } else if (currentEffect == 3) {
+      for (int i = 0; i < NUM_LEDS; i++) {
+        int wave = sin((ang * 2) + (i * 0.2)) * 127 + 128;
+        strip.setPixelColor(i, strip.Color(wave, 0, 255 - wave));
+      }
+    } else {
+      for (int i = 0; i < NUM_LEDS; i++) {
+        if (random(25) == 1) {
+          strip.setPixelColor(i, 0x00FF00);
+        } else {
+          uint32_t c = strip.getPixelColor(i);
+          strip.setPixelColor(i, strip.Color(0, (uint8_t)((c >> 8) * 0.8), 0));
+        }
+      }
+    }
+
+    strip.show();
+    delay(20);
+  }
+}
+
+// --- SETUP A LOOP ---
+
+// setup() se provede po startu zařízení jen jednou.
+// Tady se inicializuje I2C, SPI, displej, LED pásek, tlačítka i MCP expandéry.
+void setup() {
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+  tft.begin();
+  tft.setRotation(0);
+  tft.fillScreen(0);
 
   strip.begin();
   strip.show();
 
-  Serial.println();
-  Serial.println("=== Test vsech senzoru a diod ===");
-  Serial.println("Herni LED sviti zelene.");
-  Serial.println("Aktivni senzor -> blika herni LED a 2 nejblizsi LED nad ni i pod ni.");
-  Serial.println("Neherni LED jemne pulzuji cervene.");
-  Serial.println();
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_SEL, INPUT_PULLUP);
+  pinMode(BUZZER, OUTPUT);
 
-  // Priprava mapy globalPin -> (x,y)
-  for (int gp = 0; gp < 48; gp++) {
-    hasXY[gp] = false;
-  }
-
-  for (int x = 0; x < COLS; x++) {
-    for (int y = 0; y < ROWS; y++) {
-      int gp = hallGlobalPin(x, y);
-
-      if (gp >= 0 && gp < 48) {
-        hasXY[gp] = true;
-        xyByGlobalPin[gp][0] = (uint8_t)x;
-        xyByGlobalPin[gp][1] = (uint8_t)y;
-      }
+  for (int i = 0; i < 3; i++) {
+    mcp[i].begin_I2C(mcpAddr[i]);
+    for (int p = 0; p < 16; p++) {
+      mcp[i].pinMode(p, INPUT_PULLUP);
     }
   }
 
-  // Inicializace expanderu
-  for (int e = 0; e < EXP_COUNT; e++) {
-    uint8_t addr = EXP_ADDRS[e];
-
-    expPresent[e] = initMCP(addr);
-
-    Serial.print("Expander 0x");
-    Serial.print(addr, HEX);
-    Serial.print(": ");
-
-    if (!expPresent[e]) {
-      Serial.println("nenalezen / nefunguje");
-      lastState[e] = 0xFFFF;
-      continue;
-    }
-
-    uint16_t state;
-    if (!readGPIO16(addr, state)) {
-      Serial.println("nelze precist");
-      expPresent[e] = false;
-      lastState[e] = 0xFFFF;
-      continue;
-    }
-
-    lastState[e] = state;
-    Serial.println("OK");
-  }
-
-  rebuildSensorStatesFromCurrentReads();
-  renderLeds();
+  drawMenu();
+  lastInputTime = millis();
 }
 
-// =====================================================
-// LOOP
-// =====================================================
+// loop() běží pořád dokola a stará se hlavně o menu, tlačítka a spuštění her.
+void loop() {
+  checkTone();
 
-void loop()
-{
-  bool anythingChanged = false;
+  bool u = digitalRead(BTN_UP);
+  bool d = digitalRead(BTN_DOWN);
+  bool s = digitalRead(BTN_SEL);
 
-  for (int e = 0; e < EXP_COUNT; e++) {
-    if (!expPresent[e]) continue;
-
-    uint16_t currentState;
-    if (!readGPIO16(EXP_ADDRS[e], currentState)) {
-      continue;
-    }
-
-    if (currentState != lastState[e]) {
-      lastState[e] = currentState;
-      anythingChanged = true;
-    }
+  // Přechod na předchozí hru v menu.
+  if (u == LOW && lastUp == HIGH) {
+    selectedGame = (selectedGame + totalGames - 1) % totalGames;
+    drawMenu();
+    startBeep(1200, 15);
+    lastInputTime = millis();
   }
 
-  if (anythingChanged) {
-    rebuildSensorStatesFromCurrentReads();
+  // Přechod na další hru v menu.
+  if (d == LOW && lastDown == HIGH) {
+    selectedGame = (selectedGame + 1) % totalGames;
+    drawMenu();
+    startBeep(800, 15);
+    lastInputTime = millis();
   }
 
-  // Vykreslujeme porad, aby sla videt pulzace i blikani
-  renderLeds();
+  // SELECT slouží buď ke spuštění hry, nebo dlouhým stiskem k přepnutí tichého režimu.
+  if (s == LOW && lastSel == HIGH) {
+      unsigned long pressStart = millis();
+      bool longPressHappened = false;
 
-  delay(20);
+      // Smyčka, která běží, dokud držíš tlačítko
+      while (digitalRead(BTN_SEL) == LOW) {
+        checkTone(); 
+        if (millis() - pressStart > 2000) { // Pokud držíš víc než 2s
+          silentMode = !silentMode;
+          longPressHappened = true;
+          
+          // Vizuální info o přepnutí
+          tft.fillCircle(120, 120, 40, silentMode ? GC9A01A_RED : GC9A01A_GREEN);
+          tft.setCursor(95, 112);
+          tft.setTextSize(2);
+          tft.setTextColor(GC9A01A_WHITE);
+          tft.print(silentMode ? "MUTE" : "SONG");
+          
+          if (!silentMode) tone(BUZZER, 1500, 100);
+          
+          delay(1000); // Aby uživatel viděl, co se stalo
+          waitForRelease(BTN_SEL); // Počkej, až to pustí, než se vrátí do menu
+          break;
+        }
+        delay(10);
+      }
+
+      // Pokud jsi tlačítko pustil dřív než za 2s, spusť hru
+      if (!longPressHappened) {
+        if (selectedGame == 0) gameZhasniVse();
+        else if (selectedGame == 1) gamePostrehVylepseny();
+        else if (selectedGame == 2) gameDriblovani();
+        else if (selectedGame == 3) gameDirtyIce();
+        else if (selectedGame == 4) gameNajezd();
+        else if (selectedGame == 5) gameBombardak();
+      }
+
+      drawMenu();
+      lastInputTime = millis();
+    }
+
+  // Uložení předchozích stavů tlačítek kvůli správné detekci stisku.
+  lastUp = u;
+  lastDown = d;
+  lastSel = s;
+
+  // Pokud uživatel delší dobu nic nedělá, spustí se demo režim.
+  if (millis() - lastInputTime > DEMO_TIMEOUT) {
+    runDemoMode();
+    drawMenu();
+    lastInputTime = millis();
+  }
+
+  delay(10);
 }
