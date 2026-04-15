@@ -12,72 +12,121 @@ Systém je řízen mikrokontrolérem ESP32. Součástí zařízení je LED páse
 
 Výsledkem je funkční prototyp vhodný pro domácí trénink, výuku elektroniky a další rozšíření.
 
-## Hlavní cíle projektu
-- zlepšení rychlosti reakce hráče
-- zlepšení koordinace pohybu
-- zlepšení přesnosti ovládání puku
-- propojení sportovního tréninku s elektronikou a programováním
+---
 
-## Jak zařízení funguje
-- puk obsahuje magnet
-- Hallovy senzory v hrací desce detekují jeho polohu
-- ESP32 vyhodnocuje data ze senzorů
-- LED pásek označuje aktivní cíle
-- OLED displej zobrazuje informace o hře
-- hráč reaguje pohybem puku na rozsvícené body
+# Uživatelský manuál
+## Interaktivní hokejový trenažer
 
-## Použité komponenty
-- ESP32-WROOM
-- Hallův senzor 44E
-- LED pásek WS2812B
-- I²C expandér MCP23017
-- OLED displej
-- magnetický puk
+---
 
-## Herní režimy
+## 1. Úvod
 
-### 1. Náhodné cíle
-LED diody se rozsvěcují na náhodných pozicích. Hráč musí rychle reagovat a přejet správné místo pukem.
+Tento trenažer je interaktivní zařízení určené pro trénink práce s hokejovým pukem. Slouží ke zlepšení rychlosti reakce, koordinace pohybu a přesnosti ovládání puku.
 
-### 2. Driblink
-Cíle se střídají mezi více body. Hráč musí rychle přesouvat puk mezi jednotlivými pozicemi.
+Hrací deska obsahuje matici tréninkových bodů, které jsou tvořeny kombinací LED diod a Hallových senzorů. V puku je umístěn magnet, díky kterému zařízení dokáže přesně detekovat jeho polohu.
 
-### 3. Zhasni všechny cíle
-Na začátku hry se rozsvítí více bodů. Úkolem hráče je všechny postupně přejet a zhasnout v co nejkratším čase.
+Zařízení je řízeno mikrokontrolérem ESP32 a obsahuje LED pásek WS2812B, OLED displej a ovládací tlačítka.
 
-## Obsah repozitáře
+---
 
-```text
-.
-├── README.md
-├── src/
-│   └── main.ino
-├── docs/
-│   ├── Uzivatelsky_manual.md
-│   ├── Soucastky.docx
-│   └── obrazky/
-```
+## 2. Popis zařízení
 
-## Spuštění projektu
-1. Otevřít zdrojový kód v Arduino IDE nebo jiném vhodném prostředí.
-2. Zkontrolovat použité knihovny a připojený ESP32.
-3. Nahrát program do mikrokontroléru.
-4. Zapnout zařízení.
-5. Pomocí tlačítek vybrat herní režim.
-6. Spustit trénink.
+**Hrací deska**  
+Obsahuje tréninkové body s LED diodami a Hallovými senzory.
 
-## Uživatelský manuál
-Uživatelský manuál je uložen v repozitáři ve složce `docs/`.
+**LED indikace**  
+Zobrazuje aktuální cíle, na které má hráč reagovat.
 
-## Možnosti rozšíření
-- nové herní režimy
-- více tréninkových bodů
-- ukládání statistik hráče
-- propojení s mobilní aplikací
-- bezdrátový přenos dat
+**Hallovy senzory**  
+Detekují magnet v puku a zaznamenávají zásah cíle.
 
-## Výsledek projektu
-Byl vytvořen funkční prototyp interaktivního hokejového trenažeru, který propojuje elektroniku, programování a sportovní trénink. Projekt je možné dále rozšiřovat a upravovat.
+**Puk s magnetem**  
+Obsahuje magnet pro detekci pohybu na desce.
 
-## Licence
-Tento projekt byl vytvořen jako školní projekt.
+**OLED displej**
+- aktuální režim  
+- skóre  
+- čas  
+- menu  
+
+**Ovládací tlačítka**
+- levé tlačítko – předchozí položka  
+- pravé tlačítko – další položka  
+- střední tlačítko – potvrzení / spuštění hry  
+
+---
+
+## 3. Zapnutí zařízení
+
+Po zapnutí se zobrazí úvodní obrazovka a následně hlavní menu, kde si hráč vybere herní režim pomocí tlačítek.
+
+---
+
+## 4. Ovládání menu
+
+- levé tlačítko – pohyb v menu  
+- pravé tlačítko – pohyb v menu  
+- střední tlačítko – potvrzení vybrané hry  
+
+Aktuálně vybraný režim je označen na displeji. Po potvrzení se hra spustí.
+
+---
+
+## 5. Princip hry
+
+Po spuštění se rozsvítí cílový bod nebo více bodů.
+
+Úkolem hráče je:
+- sledovat aktivní cíl  
+- co nejrychleji přejet pukem dané místo  
+- systém zaznamená zásah pomocí Hallova senzoru  
+- zobrazí se další cíl  
+
+Za každý správný zásah hráč získává bod.
+
+Na displeji se zobrazuje:
+- skóre  
+- čas hry  
+
+---
+
+## 6. Herní režimy
+
+- Náhodné cíle  
+- Driblink  
+- Zhasni všechny cíle  
+
+---
+
+## 7. Průběh hry
+
+- LED diody zobrazují aktuální cíle  
+- Hallovy senzory detekují zásah  
+- systém počítá skóre  
+- displej zobrazuje průběh hry  
+
+Po skončení hry se zobrazí výsledek a zařízení se vrátí do menu.
+
+---
+
+## 8. Bezpečnost
+
+- používat na stabilním povrchu  
+- nepoužívat nadměrnou sílu  
+- nepřibližovat silné magnety k elektronice  
+- chránit zařízení před vlhkostí  
+
+---
+
+## 9. Rozšíření
+
+- nové herní režimy  
+- statistiky hráče  
+- mobilní aplikace  
+- bezdrátový přenos dat  
+
+---
+
+## 10. Závěr
+
+Trenažer umožňuje efektivní trénink práce s pukem a reakční rychlosti hráče. Díky kombinaci Hallových senzorů, LED indikace a mikrokontroléru ESP32 vzniklo zařízení, které propojuje sportovní trénink s moderní elektronikou.
